@@ -1,0 +1,162 @@
+import axios from 'axios';
+import unzipper from 'unzipper';
+import csvParser from 'csv-parser';
+import iconv from 'iconv-lite';
+import { Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import cliProgress from 'cli-progress';
+import { getDB } from '../config/database.js';
+import { SCHEMAS } from '../config/schemas.js';
+
+export async function processFilePipeline(url, config) {
+  const db = getDB();
+  const collection = db.collection(config.collectionName);
+
+  console.log(`\n⬇️  Acessando: ${url}`);
+  
+  const response = await axios({
+    method: 'get',
+    url: url,
+    responseType: 'stream'
+  });
+
+  const totalBytes = parseInt(response.headers['content-length'], 10);
+  
+  const progressBar = new cliProgress.SingleBar({
+    format: `📂 Destino: '${config.collectionName}' | {bar} | {percentage}% | 💾 Upserts no DB: {savedCount} | {value}/{total} Bytes`,
+    barCompleteChar: '\u2588',
+    barIncompleteChar: '\u2591',
+    hideCursor: true
+  });
+
+  if (totalBytes) progressBar.start(totalBytes, 0, { savedCount: 0 });
+
+  response.data.on('data', (chunk) => {
+    if (totalBytes) progressBar.increment(chunk.length);
+  });
+
+  return new Promise((resolve, reject) => {
+    let fileProcessed = false;
+    const unzipStream = unzipper.Parse();
+
+    unzipStream.on('entry', async (entry) => {
+      const fileName = entry.path.toUpperCase();
+
+      if (entry.type === 'File' && fileName.includes(config.fileIdentifier.toUpperCase())) {
+        fileProcessed = true;
+
+        const decodeStream = iconv.decodeStream('win1252');
+        const csvStream = csvParser({ separator: ';', headers: config.headers, skipLines: 0 });
+        const batchInsertStream = createBatchInsertStream(collection, config.collectionName, progressBar);
+
+        try {
+          await pipeline(entry, decodeStream, csvStream, batchInsertStream);
+          
+          if (totalBytes) progressBar.stop(); 
+          console.log(`✅ Ficheiro '${fileName}' processado e sincronizado com sucesso!`);
+          
+          response.data.destroy();
+          resolve(); 
+        } catch (err) {
+          if (totalBytes) progressBar.stop();
+          console.error(`\n❌ Erro durante o pipeline de inserção:`, err.message);
+          reject(err);
+        }
+      } else {
+        entry.autodrain();
+      }
+    });
+
+    unzipStream.on('finish', () => {
+      if (!fileProcessed) {
+        if (totalBytes) progressBar.stop();
+        console.warn(`\n⚠️ O identificador '${config.fileIdentifier}' não foi encontrado no ZIP.`);
+        resolve(); 
+      }
+    });
+
+    unzipStream.on('error', (err) => {
+      if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+        if (totalBytes) progressBar.stop();
+        reject(err);
+      }
+    });
+
+    response.data.pipe(unzipStream);
+  });
+}
+
+function createBatchInsertStream(collection, collectionName, progressBar) {
+  let batch = [];
+  let totalSaved = 0;
+  const BATCH_SIZE = 10000; 
+
+  return new Writable({
+    objectMode: true,
+    async write(chunk, encoding, callback) {
+      batch.push(chunk);
+
+      if (batch.length >= BATCH_SIZE) {
+        try {
+          await executeBulkWrite(collection, collectionName, batch);
+          totalSaved += batch.length;
+          
+          if (progressBar) {
+            progressBar.update({ savedCount: totalSaved });
+          }
+          
+          batch = []; 
+          callback();
+        } catch (error) {
+          callback(error); 
+        }
+      } else {
+        callback();
+      }
+    },
+    async final(callback) {
+      if (batch.length > 0) {
+        try {
+          await executeBulkWrite(collection, collectionName, batch);
+          totalSaved += batch.length;
+          
+          if (progressBar) {
+            progressBar.update({ savedCount: totalSaved });
+          }
+          callback();
+        } catch (error) {
+          callback(error);
+        }
+      } else {
+        callback();
+      }
+    }
+  });
+}
+
+async function executeBulkWrite(collection, collectionName, batch) {
+  const schemaConfig = SCHEMAS[collectionName];
+
+  if (!schemaConfig) {
+    throw new Error(`Schema não encontrado para a coleção: ${collectionName}`);
+  }
+
+  const operations = batch.map((row) => {
+    const processedRow = schemaConfig.transform ? schemaConfig.transform(row) : row;
+
+    const filter = {};
+    schemaConfig.primaryKeys.forEach(key => {
+      filter[key] = processedRow[key] || null; 
+    });
+
+    return {
+      updateOne: {
+        filter: filter,
+        update: { $set: processedRow },
+        upsert: true
+      }
+    };
+  });
+
+  await collection.bulkWrite(operations, { ordered: false, writeConcern: { w: 0 } });
+}
