@@ -1,11 +1,14 @@
+version: '3.8'
+
 services:
   app-cli:
     build: .
-    command: ["node", "src/index.js"]
+    container_name: cnpj-etl-app
+    restart: on-failure
     environment:
-      - BASE_URL=https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/
       - MONGO_URI=${MONGO_URI}
-      - NODE_OPTIONS="--max-old-space-size=4096" 
+      - BASE_URL=https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/
+      - NODE_OPTIONS=--max-old-space-size=4096
     volumes:
       - ./data:/app/data
     depends_on:
@@ -13,11 +16,14 @@ services:
 
   mongo:
     image: mongo:6
-    volumes:
-      - mongo_data:/data/db
+    container_name: cnpj-etl-mongo
+    restart: unless-stopped
     ports:
       - "27017:27017"
-    command: ["--wiredTigerCacheSizeGB", "1.5"]
+    volumes:
+      - mongo_data:/data/db
+    command: 
+      - --wiredTigerCacheSizeGB=1.5
 
 volumes:
   mongo_data:
