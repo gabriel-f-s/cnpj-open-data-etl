@@ -60,11 +60,15 @@ export async function processFilePipeline(url, config) {
   });
   resetIdleTimeout();
 
-  response.data.on('end', () => clearTimeout(idleTimeout));
-  response.data.on('close', () => clearTimeout(idleTimeout));
-  response.data.on('error', () => clearTimeout(idleTimeout));
-
   return new Promise((resolve, reject) => {
+    response.data.on('end', () => clearTimeout(idleTimeout));
+    response.data.on('close', () => clearTimeout(idleTimeout));
+    response.data.on('error', (err) => {
+      clearTimeout(idleTimeout);
+      if (totalBytes) progressBar.stop();
+      reject(err);
+    });
+
     let fileProcessed = false;
     const unzipStream = unzipper.Parse();
 
