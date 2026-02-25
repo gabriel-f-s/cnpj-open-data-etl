@@ -1,4 +1,5 @@
 import axios from 'axios';
+import axiosRetry from 'axios-retry';
 import unzipper from 'unzipper';
 import csvParser from 'csv-parser';
 import iconv from 'iconv-lite';
@@ -8,20 +9,32 @@ import cliProgress from 'cli-progress';
 import { getDB } from '../config/database.js';
 import { SCHEMAS } from '../config/schemas.js';
 
+axiosRetry(axios, {
+  retries: 5,
+  retryDelay: (retryCount) => {
+    console.log(`\n⚠️ Servidor instável. Tentativa ${retryCount} de reconexão em ${retryCount * 5} segundos...`);
+    return retryCount * 5000;
+  },
+  retryCondition: (error) => {
+    return axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED';
+  }
+});
+
 export async function processFilePipeline(url, config) {
   const db = getDB();
   const collection = db.collection(config.collectionName);
 
   console.log(`\n⬇️  Acessando: ${url}`);
-  
+
   const response = await axios({
     method: 'get',
     url: url,
-    responseType: 'stream'
+    responseType: 'stream',
+    timeout: 30000
   });
 
   const totalBytes = parseInt(response.headers['content-length'], 10);
-  
+
   const progressBar = new cliProgress.SingleBar({
     format: `📂 Destino: '${config.collectionName}' | {bar} | {percentage}% | 💾 Upserts no DB: {savedCount} | {value}/{total} Bytes`,
     barCompleteChar: '\u2588',
@@ -31,9 +44,25 @@ export async function processFilePipeline(url, config) {
 
   if (totalBytes) progressBar.start(totalBytes, 0, { savedCount: 0 });
 
+  let idleTimeout;
+  const resetIdleTimeout = () => {
+    clearTimeout(idleTimeout);
+    idleTimeout = setTimeout(() => {
+      if (totalBytes) progressBar.stop();
+      console.error(`\n⏳ NETWORK TIMEOUT: Servidor do governo parou de responder há 60 segundos.`);
+      response.data.destroy(new Error('NETWORK_IDLE_TIMEOUT'));
+    }, 60000);
+  };
+
   response.data.on('data', (chunk) => {
     if (totalBytes) progressBar.increment(chunk.length);
+    resetIdleTimeout();
   });
+  resetIdleTimeout();
+
+  response.data.on('end', () => clearTimeout(idleTimeout));
+  response.data.on('close', () => clearTimeout(idleTimeout));
+  response.data.on('error', () => clearTimeout(idleTimeout));
 
   return new Promise((resolve, reject) => {
     let fileProcessed = false;
@@ -51,14 +80,16 @@ export async function processFilePipeline(url, config) {
 
         try {
           await pipeline(entry, decodeStream, csvStream, batchInsertStream);
-          
-          if (totalBytes) progressBar.stop(); 
+
+          if (totalBytes) progressBar.stop();
+          clearTimeout(idleTimeout);
           console.log(`✅ Ficheiro '${fileName}' processado e sincronizado com sucesso!`);
-          
+
           response.data.destroy();
-          resolve(); 
+          resolve();
         } catch (err) {
           if (totalBytes) progressBar.stop();
+          clearTimeout(idleTimeout);
           console.error(`\n❌ Erro durante o pipeline de inserção:`, err.message);
           reject(err);
         }
@@ -70,14 +101,16 @@ export async function processFilePipeline(url, config) {
     unzipStream.on('finish', () => {
       if (!fileProcessed) {
         if (totalBytes) progressBar.stop();
+        clearTimeout(idleTimeout);
         console.warn(`\n⚠️ O identificador '${config.fileIdentifier}' não foi encontrado no ZIP.`);
-        resolve(); 
+        resolve();
       }
     });
 
     unzipStream.on('error', (err) => {
       if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
         if (totalBytes) progressBar.stop();
+        clearTimeout(idleTimeout);
         reject(err);
       }
     });
@@ -89,7 +122,7 @@ export async function processFilePipeline(url, config) {
 function createBatchInsertStream(collection, collectionName, progressBar) {
   let batch = [];
   let totalSaved = 0;
-  const BATCH_SIZE = 10000; 
+  const BATCH_SIZE = 10000;
 
   return new Writable({
     objectMode: true,
@@ -100,15 +133,11 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
         try {
           await executeBulkWrite(collection, collectionName, batch);
           totalSaved += batch.length;
-          
-          if (progressBar) {
-            progressBar.update({ savedCount: totalSaved });
-          }
-          
-          batch = []; 
+          if (progressBar) progressBar.update({ savedCount: totalSaved });
+          batch = [];
           callback();
         } catch (error) {
-          callback(error); 
+          callback(error);
         }
       } else {
         callback();
@@ -119,10 +148,7 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
         try {
           await executeBulkWrite(collection, collectionName, batch);
           totalSaved += batch.length;
-          
-          if (progressBar) {
-            progressBar.update({ savedCount: totalSaved });
-          }
+          if (progressBar) progressBar.update({ savedCount: totalSaved });
           callback();
         } catch (error) {
           callback(error);
@@ -136,25 +162,15 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
 
 async function executeBulkWrite(collection, collectionName, batch) {
   const schemaConfig = SCHEMAS[collectionName];
-
-  if (!schemaConfig) {
-    throw new Error(`Schema não encontrado para a coleção: ${collectionName}`);
-  }
+  if (!schemaConfig) throw new Error(`Schema não encontrado: ${collectionName}`);
 
   const operations = batch.map((row) => {
     const processedRow = schemaConfig.transform ? schemaConfig.transform(row) : row;
-
     const filter = {};
-    schemaConfig.primaryKeys.forEach(key => {
-      filter[key] = processedRow[key] || null; 
-    });
+    schemaConfig.primaryKeys.forEach(key => { filter[key] = processedRow[key] || null; });
 
     return {
-      updateOne: {
-        filter: filter,
-        update: { $set: processedRow },
-        upsert: true
-      }
+      updateOne: { filter: filter, update: { $set: processedRow }, upsert: true }
     };
   });
 

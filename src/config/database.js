@@ -10,7 +10,6 @@ export async function connectDB() {
 
   try {
     console.log('🔌 Conectando ao MongoDB...');
-    
     client = new MongoClient(config.mongo.uri, {
       minPoolSize: 5,
       maxPoolSize: 20,
@@ -20,13 +19,12 @@ export async function connectDB() {
     await client.connect();
     db = client.db(config.mongo.dbName);
     console.log('✅ Conectado ao MongoDB com sucesso!');
-    
+
     await ensureIndexes(db);
-    
     return client;
   } catch (error) {
     console.error('❌ Erro ao conectar no MongoDB:', error);
-    process.exit(1); 
+    process.exit(1);
   }
 }
 
@@ -45,24 +43,19 @@ export async function closeDB() {
 }
 
 async function ensureIndexes(database) {
-  console.log('⏳ Verificando e criando índices... Isto pode demorar alguns segundos.');
-  
+  console.log('⏳ Verificando integridade dos Índices Únicos...');
+
   for (const [collectionName, schema] of Object.entries(SCHEMAS)) {
     if (schema.primaryKeys && schema.primaryKeys.length > 0) {
       const indexDefinition = {};
-      schema.primaryKeys.forEach(key => {
-        indexDefinition[key] = 1;
-      });
+      schema.primaryKeys.forEach(key => { indexDefinition[key] = 1; });
 
       try {
-        await database.collection(collectionName).createIndex(
-          indexDefinition, 
-          { unique: true }
-        );
+        await database.collection(collectionName).createIndex(indexDefinition, { unique: true });
       } catch (err) {
-        console.warn(`⚠️ Aviso ao criar índice para ${collectionName}: ${err.message}`);
+        console.warn(`⚠️ Aviso ao verificar índice para ${collectionName}: ${err.message}`);
       }
     }
   }
-  console.log('ℹ️ Índices otimizados com sucesso.');
+  console.log('ℹ️ Índices otimizados e prontos.');
 }
