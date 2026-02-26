@@ -1,5 +1,4 @@
 import axios from 'axios';
-import axiosRetry from 'axios-retry';
 import unzipper from 'unzipper';
 import csvParser from 'csv-parser';
 import iconv from 'iconv-lite';
@@ -9,32 +8,45 @@ import cliProgress from 'cli-progress';
 import { getDB } from '../config/database.js';
 import { SCHEMAS } from '../config/schemas.js';
 
-axiosRetry(axios, {
-  retries: 5,
-  retryDelay: (retryCount) => {
-    console.log(`\n⚠️ Servidor instável. Tentativa ${retryCount} de reconexão em ${retryCount * 5} segundos...`);
-    return retryCount * 5000;
-  },
-  retryCondition: (error) => {
-    return axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED';
-  }
-});
+// Função principal que gerencia as tentativas (Substitui o axios-retry)
+export async function processFilePipeline(url, config, attempt = 1) {
+  const MAX_RETRIES = 5;
 
-export async function processFilePipeline(url, config) {
+  try {
+    await executeStreamLogic(url, config);
+  } catch (error) {
+    if (attempt <= MAX_RETRIES) {
+      const waitTime = attempt * 10000; // 10s, 20s, 30s...
+      console.log(`\n⚠️ Falha na conexão ou extração: ${error.message}`);
+      console.log(`⏳ Aguardando ${waitTime / 1000}s para a tentativa ${attempt + 1} de ${MAX_RETRIES}...`);
+      
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      
+      // Chama a si mesma recursivamente, recriando TUDO do zero
+      return processFilePipeline(url, config, attempt + 1); 
+    }
+    
+    // Se esgotar as tentativas, lança o erro para o Docker reiniciar
+    throw new Error(`Falha definitiva após ${MAX_RETRIES} tentativas: ${error.message}`);
+  }
+}
+
+// A lógica de extração isolada
+async function executeStreamLogic(url, config) {
   const db = getDB();
   const collection = db.collection(config.collectionName);
 
   console.log(`\n⬇️  Acessando: ${url}`);
-
+  
   const response = await axios({
     method: 'get',
     url: url,
     responseType: 'stream',
-    timeout: 30000
+    timeout: 30000 
   });
 
   const totalBytes = parseInt(response.headers['content-length'], 10);
-
+  
   const progressBar = new cliProgress.SingleBar({
     format: `📂 Destino: '${config.collectionName}' | {bar} | {percentage}% | 💾 Upserts no DB: {savedCount} | {value}/{total} Bytes`,
     barCompleteChar: '\u2588',
@@ -44,23 +56,28 @@ export async function processFilePipeline(url, config) {
 
   if (totalBytes) progressBar.start(totalBytes, 0, { savedCount: 0 });
 
-  let idleTimeout;
-  const resetIdleTimeout = () => {
-    clearTimeout(idleTimeout);
-    idleTimeout = setTimeout(() => {
-      if (totalBytes) progressBar.stop();
-      console.error(`\n⏳ NETWORK TIMEOUT: Servidor do governo parou de responder há 60 segundos.`);
-      response.data.destroy(new Error('NETWORK_IDLE_TIMEOUT'));
-    }, 60000);
-  };
-
-  response.data.on('data', (chunk) => {
-    if (totalBytes) progressBar.increment(chunk.length);
-    resetIdleTimeout();
-  });
-  resetIdleTimeout();
-
   return new Promise((resolve, reject) => {
+    // 🐕 --- CÃO DE GUARDA AGRESSIVO ---
+    let idleTimeout;
+    const resetIdleTimeout = () => {
+      clearTimeout(idleTimeout);
+      idleTimeout = setTimeout(() => {
+        if (totalBytes) progressBar.stop();
+        console.error(`\n⏳ NETWORK TIMEOUT: O servidor congelou há 60 segundos.`);
+        if (response.data) response.data.destroy();
+        // A rejeição direta garante que a promessa nunca fica pendurada
+        reject(new Error('NETWORK_IDLE_TIMEOUT')); 
+      }, 60000); 
+    };
+
+    response.data.on('data', (chunk) => {
+      if (totalBytes) progressBar.increment(chunk.length);
+      resetIdleTimeout(); 
+    });
+    
+    resetIdleTimeout(); 
+
+    // Limpeza de eventos do Axios
     response.data.on('end', () => clearTimeout(idleTimeout));
     response.data.on('close', () => clearTimeout(idleTimeout));
     response.data.on('error', (err) => {
@@ -84,21 +101,20 @@ export async function processFilePipeline(url, config) {
 
         try {
           await pipeline(entry, decodeStream, csvStream, batchInsertStream);
-
-          if (totalBytes) progressBar.stop();
+          
+          if (totalBytes) progressBar.stop(); 
           clearTimeout(idleTimeout);
           console.log(`✅ Ficheiro '${fileName}' processado e sincronizado com sucesso!`);
-
-          response.data.destroy();
-          resolve();
+          
+          response.data.destroy(); 
+          resolve(); 
         } catch (err) {
           if (totalBytes) progressBar.stop();
           clearTimeout(idleTimeout);
-          console.error(`\n❌ Erro durante o pipeline de inserção:`, err.message);
           reject(err);
         }
       } else {
-        entry.autodrain();
+        entry.autodrain(); 
       }
     });
 
@@ -107,7 +123,7 @@ export async function processFilePipeline(url, config) {
         if (totalBytes) progressBar.stop();
         clearTimeout(idleTimeout);
         console.warn(`\n⚠️ O identificador '${config.fileIdentifier}' não foi encontrado no ZIP.`);
-        resolve();
+        resolve(); 
       }
     });
 
@@ -119,6 +135,7 @@ export async function processFilePipeline(url, config) {
       }
     });
 
+    // Inicia o fluxo
     response.data.pipe(unzipStream);
   });
 }
@@ -126,7 +143,7 @@ export async function processFilePipeline(url, config) {
 function createBatchInsertStream(collection, collectionName, progressBar) {
   let batch = [];
   let totalSaved = 0;
-  const BATCH_SIZE = 10000;
+  const BATCH_SIZE = 10000; 
 
   return new Writable({
     objectMode: true,
@@ -138,10 +155,10 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
           await executeBulkWrite(collection, collectionName, batch);
           totalSaved += batch.length;
           if (progressBar) progressBar.update({ savedCount: totalSaved });
-          batch = [];
+          batch = []; 
           callback();
         } catch (error) {
-          callback(error);
+          callback(error); 
         }
       } else {
         callback();
