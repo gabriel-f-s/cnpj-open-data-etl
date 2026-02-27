@@ -13,9 +13,11 @@ const STATE_FILE = path.resolve('./data/state.json');
 async function loadState() {
   try {
     const data = await fs.readFile(STATE_FILE, 'utf-8');
-    return JSON.parse(data);
+    const state = JSON.parse(data);
+    if (!state.file_progress) state.file_progress = {};
+    return state;
   } catch {
-    return { last_processed_date: null, processed_files: [] };
+    return { last_processed_date: null, processed_files: [], file_progress: {} };
   }
 }
 
@@ -24,20 +26,18 @@ async function saveState(state) {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-async function processWithRetry(url, config, maxRetries = 5) {
+async function processWithRetry(url, config, state, fileName, saveStateFn, maxRetries = 5) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      await processFilePipeline(url, config);
+      await processFilePipeline(url, config, state, fileName, saveStateFn);
       return;
     } catch (error) {
-      console.warn(`\n⚠️ Falha no arquivo ${config.fileIdentifier} (Tentativa ${attempt}/${maxRetries}): ${error.message}`);
-
+      console.warn(`\n⚠️ Falha na conexão ou extração: ${error.message}`);
       if (attempt === maxRetries) {
         throw new Error(`Falha definitiva após ${maxRetries} tentativas no arquivo ${config.fileIdentifier}.`);
       }
-
       const waitTime = attempt * 10000;
-      console.log(`⏳ Aguardando ${waitTime / 1000}s para tentar reconexão...`);
+      console.log(`⏳ Aguardando ${waitTime / 1000}s para a tentativa ${attempt + 1} de ${maxRetries}...`);
       await new Promise(res => setTimeout(res, waitTime));
     }
   }
@@ -45,7 +45,7 @@ async function processWithRetry(url, config, maxRetries = 5) {
 
 async function main() {
   console.time('⏱️ Tempo Total de Execução');
-  console.log('🚀 A iniciar CLI de ETL (Modo Resiliente com Checkpoint por Arquivo)...\n');
+  console.log('🚀 A iniciar CLI de ETL (Modo Resiliente com Micro-Checkpoint)...\n');
 
   let hadError = false;
   try {
@@ -69,12 +69,11 @@ async function main() {
       console.log(`🔄 Novo mês detectado. Limpando histórico de arquivos processados...`);
       state.last_processed_date = latestDateDir;
       state.processed_files = [];
+      state.file_progress = {};
       await saveState(state);
     }
 
-    const baseUrlNormalized = config.app.baseUrl.endsWith('/') ? config.app.baseUrl : `${config.app.baseUrl}/`;
-    const targetUrl = `${baseUrlNormalized}${latestDateDir}/`;
-
+    const targetUrl = `${config.app.baseUrl.endsWith('/') ? config.app.baseUrl : config.app.baseUrl + '/'}${latestDateDir}/`;
     const dateResponse = await axios.get(targetUrl);
     const files = extractZipFiles(dateResponse.data, targetUrl);
 
@@ -83,7 +82,7 @@ async function main() {
     console.log(`======================================================`);
     console.log(`📦 ${files.length} ficheiros ZIP encontrados no total.\n`);
 
-    const limit = pLimit(1);
+    const limit = pLimit(3);
     const promises = [];
 
     for (const file of files) {
@@ -104,15 +103,16 @@ async function main() {
       };
 
       promises.push(limit(async () => {
-        await processWithRetry(file.url, pipelineConfig);
+        await processWithRetry(file.url, pipelineConfig, state, fileName, saveState);
+
         state.processed_files.push(fileName);
+        delete state.file_progress[fileName];
         await saveState(state);
-        console.log(`📝 Estado guardado: '${fileName}' marcado como concluído no Checkpoint.`);
+        console.log(`📝 Estado guardado: '${fileName}' marcado como concluído.`);
       }));
     }
 
     await Promise.all(promises);
-
     console.log('\n🎉 ETL concluído! Todos os dados estão perfeitamente sincronizados.');
 
   } catch (error) {

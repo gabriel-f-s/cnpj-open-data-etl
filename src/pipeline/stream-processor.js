@@ -8,76 +8,52 @@ import cliProgress from 'cli-progress';
 import { getDB } from '../config/database.js';
 import { SCHEMAS } from '../config/schemas.js';
 
-// Função principal que gerencia as tentativas (Substitui o axios-retry)
-export async function processFilePipeline(url, config, attempt = 1) {
-  const MAX_RETRIES = 5;
-
-  try {
-    await executeStreamLogic(url, config);
-  } catch (error) {
-    if (attempt <= MAX_RETRIES) {
-      const waitTime = attempt * 10000; // 10s, 20s, 30s...
-      console.log(`\n⚠️ Falha na conexão ou extração: ${error.message}`);
-      console.log(`⏳ Aguardando ${waitTime / 1000}s para a tentativa ${attempt + 1} de ${MAX_RETRIES}...`);
-      
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-      
-      // Chama a si mesma recursivamente, recriando TUDO do zero
-      return processFilePipeline(url, config, attempt + 1); 
-    }
-    
-    // Se esgotar as tentativas, lança o erro para o Docker reiniciar
-    throw new Error(`Falha definitiva após ${MAX_RETRIES} tentativas: ${error.message}`);
-  }
-}
-
-// A lógica de extração isolada
-async function executeStreamLogic(url, config) {
+export async function processFilePipeline(url, config, state, fileName, saveStateFn) {
   const db = getDB();
   const collection = db.collection(config.collectionName);
 
+  const linesToSkip = state.file_progress[fileName] || 0;
+
   console.log(`\n⬇️  Acessando: ${url}`);
-  
+  if (linesToSkip > 0) {
+    console.log(`⏩ Micro-Checkpoint: Pulando as primeiras ${linesToSkip} linhas já processadas...`);
+  }
+
   const response = await axios({
     method: 'get',
     url: url,
     responseType: 'stream',
-    timeout: 30000 
+    timeout: 30000
   });
 
   const totalBytes = parseInt(response.headers['content-length'], 10);
-  
+
   const progressBar = new cliProgress.SingleBar({
-    format: `📂 Destino: '${config.collectionName}' | {bar} | {percentage}% | 💾 Upserts no DB: {savedCount} | {value}/{total} Bytes`,
+    format: `📂 Destino: '${config.collectionName}' | {bar} | {percentage}% | 💾 Inserções: {savedCount} | {value}/{total} Bytes`,
     barCompleteChar: '\u2588',
     barIncompleteChar: '\u2591',
     hideCursor: true
   });
 
-  if (totalBytes) progressBar.start(totalBytes, 0, { savedCount: 0 });
+  if (totalBytes) progressBar.start(totalBytes, 0, { savedCount: linesToSkip });
+
+  let idleTimeout;
+  const resetIdleTimeout = () => {
+    clearTimeout(idleTimeout);
+    idleTimeout = setTimeout(() => {
+      if (totalBytes) progressBar.stop();
+      console.error(`\n⏳ NETWORK TIMEOUT: Servidor do governo parou de responder há 5 minutos.`);
+      response.data.destroy(new Error('NETWORK_IDLE_TIMEOUT'));
+    }, 300000);
+  };
+
+  response.data.on('data', (chunk) => {
+    if (totalBytes) progressBar.increment(chunk.length);
+    resetIdleTimeout();
+  });
+  resetIdleTimeout();
 
   return new Promise((resolve, reject) => {
-    // 🐕 --- CÃO DE GUARDA AGRESSIVO ---
-    let idleTimeout;
-    const resetIdleTimeout = () => {
-      clearTimeout(idleTimeout);
-      idleTimeout = setTimeout(() => {
-        if (totalBytes) progressBar.stop();
-        console.error(`\n⏳ NETWORK TIMEOUT: O servidor congelou há 60 segundos.`);
-        if (response.data) response.data.destroy();
-        // A rejeição direta garante que a promessa nunca fica pendurada
-        reject(new Error('NETWORK_IDLE_TIMEOUT')); 
-      }, 60000); 
-    };
-
-    response.data.on('data', (chunk) => {
-      if (totalBytes) progressBar.increment(chunk.length);
-      resetIdleTimeout(); 
-    });
-    
-    resetIdleTimeout(); 
-
-    // Limpeza de eventos do Axios
     response.data.on('end', () => clearTimeout(idleTimeout));
     response.data.on('close', () => clearTimeout(idleTimeout));
     response.data.on('error', (err) => {
@@ -90,31 +66,30 @@ async function executeStreamLogic(url, config) {
     const unzipStream = unzipper.Parse();
 
     unzipStream.on('entry', async (entry) => {
-      const fileName = entry.path.toUpperCase();
+      const entryName = entry.path.toUpperCase();
 
-      if (entry.type === 'File' && fileName.includes(config.fileIdentifier.toUpperCase())) {
+      if (entry.type === 'File' && entryName.includes(config.fileIdentifier.toUpperCase())) {
         fileProcessed = true;
 
         const decodeStream = iconv.decodeStream('win1252');
-        const csvStream = csvParser({ separator: ';', headers: config.headers, skipLines: 0 });
-        const batchInsertStream = createBatchInsertStream(collection, config.collectionName, progressBar);
+        const csvStream = csvParser({ separator: ';', headers: config.headers, skipLines: linesToSkip });
+        const batchInsertStream = createBatchInsertStream(collection, config.collectionName, progressBar, state, fileName, saveStateFn, linesToSkip);
 
         try {
           await pipeline(entry, decodeStream, csvStream, batchInsertStream);
-          
-          if (totalBytes) progressBar.stop(); 
+          if (totalBytes) progressBar.stop();
           clearTimeout(idleTimeout);
-          console.log(`✅ Ficheiro '${fileName}' processado e sincronizado com sucesso!`);
-          
-          response.data.destroy(); 
-          resolve(); 
+          console.log(`✅ Ficheiro '${entryName}' processado e sincronizado com sucesso!`);
+          response.data.destroy();
+          resolve();
         } catch (err) {
           if (totalBytes) progressBar.stop();
           clearTimeout(idleTimeout);
+          console.error(`\n❌ Erro durante o pipeline de inserção:`, err.message);
           reject(err);
         }
       } else {
-        entry.autodrain(); 
+        entry.autodrain();
       }
     });
 
@@ -123,7 +98,7 @@ async function executeStreamLogic(url, config) {
         if (totalBytes) progressBar.stop();
         clearTimeout(idleTimeout);
         console.warn(`\n⚠️ O identificador '${config.fileIdentifier}' não foi encontrado no ZIP.`);
-        resolve(); 
+        resolve();
       }
     });
 
@@ -135,15 +110,14 @@ async function executeStreamLogic(url, config) {
       }
     });
 
-    // Inicia o fluxo
     response.data.pipe(unzipStream);
   });
 }
 
-function createBatchInsertStream(collection, collectionName, progressBar) {
+function createBatchInsertStream(collection, collectionName, progressBar, state, fileName, saveStateFn, linesToSkip) {
   let batch = [];
-  let totalSaved = 0;
-  const BATCH_SIZE = 10000; 
+  let totalSaved = linesToSkip;
+  const BATCH_SIZE = 10000;
 
   return new Writable({
     objectMode: true,
@@ -155,10 +129,14 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
           await executeBulkWrite(collection, collectionName, batch);
           totalSaved += batch.length;
           if (progressBar) progressBar.update({ savedCount: totalSaved });
-          batch = []; 
+
+          state.file_progress[fileName] = totalSaved;
+          await saveStateFn(state);
+
+          batch = [];
           callback();
         } catch (error) {
-          callback(error); 
+          callback(error);
         }
       } else {
         callback();
@@ -170,6 +148,8 @@ function createBatchInsertStream(collection, collectionName, progressBar) {
           await executeBulkWrite(collection, collectionName, batch);
           totalSaved += batch.length;
           if (progressBar) progressBar.update({ savedCount: totalSaved });
+          state.file_progress[fileName] = totalSaved;
+          await saveStateFn(state);
           callback();
         } catch (error) {
           callback(error);
@@ -185,15 +165,14 @@ async function executeBulkWrite(collection, collectionName, batch) {
   const schemaConfig = SCHEMAS[collectionName];
   if (!schemaConfig) throw new Error(`Schema não encontrado: ${collectionName}`);
 
-  const operations = batch.map((row) => {
-    const processedRow = schemaConfig.transform ? schemaConfig.transform(row) : row;
-    const filter = {};
-    schemaConfig.primaryKeys.forEach(key => { filter[key] = processedRow[key] || null; });
+  const transformedBatch = batch.map((row) => schemaConfig.transform ? schemaConfig.transform(row) : row);
 
-    return {
-      updateOne: { filter: filter, update: { $set: processedRow }, upsert: true }
-    };
-  });
-
-  await collection.bulkWrite(operations, { ordered: false, writeConcern: { w: 0 } });
+  try {
+    await collection.insertMany(transformedBatch, { ordered: false, writeConcern: { w: 0 } });
+  } catch (error) {
+    if (error.code === 11000 || (error.writeErrors && error.writeErrors.some(e => e.code === 11000))) {
+      return;
+    }
+    throw error;
+  }
 }
