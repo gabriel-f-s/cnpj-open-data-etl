@@ -1,4 +1,5 @@
-import { Controller, Get, NotFoundException, Param, Query } from '@nestjs/common';
+import { CacheInterceptor } from '@nestjs/cache-manager';
+import { Controller, Get, NotFoundException, Param, Query, UseInterceptors } from '@nestjs/common';
 import { CnpjService } from './cnpj.service';
 import { ListCnpjsQueryDto } from './dto/list-cnpjs-query.dto';
 import { CnpjParamDto } from './dto/cnpj-param.dto';
@@ -12,6 +13,7 @@ export class CnpjController {
     return this.cnpjService.listCnpjs(query);
   }
 
+  @UseInterceptors(CacheInterceptor)
   @Get(':cnpj')
   async detail(@Param() params: CnpjParamDto) {
     const result = await this.cnpjService.getCnpjDetail(params.cnpj);
