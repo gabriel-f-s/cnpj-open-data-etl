@@ -1,0 +1,8 @@
+### Listagem de CNPJs
+GET http://localhost:3000/cnpjs
+
+### Detalhe do CNPJ
+GET http://localhost:3000/cnpjs/02558157000162
+
+### Listagem filtrada por CNPJ
+GET http://localhost:3000/cnpjs?cnpj=02558157000162

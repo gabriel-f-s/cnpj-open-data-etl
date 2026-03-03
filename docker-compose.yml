@@ -14,6 +14,21 @@ services:
     depends_on:
       - mongo
 
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: cnpj-etl-api
+    restart: unless-stopped
+    environment:
+      - MONGO_URI=${MONGO_URI}
+      - DB_NAME=${DB_NAME}
+      - PORT=3000
+    ports:
+      - '3000:3000'
+    depends_on:
+      - mongo
+
   mongo:
     image: mongo:6
     container_name: cnpj-etl-mongo
